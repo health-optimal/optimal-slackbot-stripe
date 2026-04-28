@@ -1,4 +1,3 @@
-
 const crypto = require("crypto");
 const https = require("https");
 
@@ -46,7 +45,17 @@ export default async function handler(req, res) {
   if (event.type === "charge.succeeded") {
     const charge = event.data.object;
 
-    const name = charge.billing_details?.name || "Sin nombre";
+    // Nombre: priorizar el del Customer en Stripe, fallback a billing_details
+    let name = charge.billing_details?.name || "Sin nombre";
+    if (charge.customer) {
+      try {
+        const customer = await getStripeCustomer(charge.customer);
+        if (customer?.name) name = customer.name;
+      } catch (err) {
+        console.error("No se pudo obtener el Customer, uso billing_details:", err.message);
+      }
+    }
+
     const email = charge.billing_details?.email || charge.receipt_email || "Sin email";
     const amount = (charge.amount / 100).toFixed(2);
     const currency = charge.currency.toUpperCase();
@@ -96,73 +105,4 @@ export default async function handler(req, res) {
       await postToSlack(slackMessage);
       console.log(`Notificación enviada: ${chargeId} - ${name} - ${amount} ${currency}`);
     } catch (err) {
-      console.error("Error posting to Slack:", err.message);
-      return res.status(500).send("Error posting to Slack");
-    }
-  }
-
-  res.status(200).json({ received: true });
-}
-
-function verifyStripeSignature(payload, signatureHeader, secret) {
-  const parts = signatureHeader.split(",").reduce((acc, part) => {
-    const [key, value] = part.split("=");
-    acc[key.trim()] = value;
-    return acc;
-  }, {});
-
-  const timestamp = parts["t"];
-  const expectedSig = parts["v1"];
-
-  if (!timestamp || !expectedSig) {
-    throw new Error("Invalid signature header format");
-  }
-
-  const tolerance = 300;
-  const now = Math.floor(Date.now() / 1000);
-  if (now - parseInt(timestamp) > tolerance) {
-    throw new Error("Timestamp too old");
-  }
-
-  const signedPayload = `${timestamp}.${payload}`;
-  const computedSig = crypto
-    .createHmac("sha256", secret)
-    .update(signedPayload, "utf8")
-    .digest("hex");
-
-  if (computedSig !== expectedSig) {
-    throw new Error("Signatures do not match");
-  }
-
-  return JSON.parse(payload);
-}
-
-function postToSlack(message) {
-  return new Promise((resolve, reject) => {
-    const url = new URL(process.env.SLACK_WEBHOOK_URL);
-    const data = JSON.stringify(message);
-
-    const options = {
-      hostname: url.hostname,
-      path: url.pathname,
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Content-Length": Buffer.byteLength(data),
-      },
-    };
-
-    const req = https.request(options, (res) => {
-      let body = "";
-      res.on("data", (chunk) => (body += chunk));
-      res.on("end", () => {
-        if (res.statusCode === 200) resolve(body);
-        else reject(new Error(`Slack responded with ${res.statusCode}: ${body}`));
-      });
-    });
-
-    req.on("error", reject);
-    req.write(data);
-    req.end();
-  });
-}
+      console.error("Error
