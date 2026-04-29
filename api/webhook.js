@@ -142,44 +142,56 @@ export default async function handler(req, res) {
   try {
     let slackMessage = null;
 
-    // Helper: formatear fechas en hora Lima
     const fmtDate = (unixSec) =>
       new Date(
         (unixSec || Math.floor(Date.now() / 1000)) * 1000
       ).toLocaleString("es-PE", { timeZone: "America/Lima" });
 
-    // Helper: SIEMPRE resuelve el nombre desde el Stripe Customer (customer.name).
-    // Devuelve "Sin nombre" si no hay customerId o el Customer no tiene name.
-    const resolveCustomerName = async (customerId) => {
-      if (!customerId) return "Sin nombre";
+    // Trae el Customer completo de Stripe con logging defensivo.
+    // Devuelve null si no hay customerId o si la API falla.
+    const fetchCustomer = async (customerId) => {
+      if (!customerId) {
+        console.log("fetchCustomer: customerId vacío");
+        return null;
+      }
       try {
         const c = await getStripeCustomer(customerId);
-        return c?.name || "Sin nombre";
+        console.log(
+          `fetchCustomer OK: id=${customerId} name=${c?.name || "(vacío)"} email=${c?.email || "(vacío)"}`
+        );
+        return c;
       } catch (err) {
-        console.error("No se pudo obtener el Customer:", err.message);
-        return "Sin nombre";
+        console.error(`fetchCustomer FAIL: id=${customerId} err=${err.message}`);
+        return null;
       }
     };
 
-    // Helper: resuelve email desde el Customer; si falla, usa fallback.
-    const resolveCustomerEmail = async (customerId, fallback) => {
-      if (!customerId) return fallback || "Sin email";
-      try {
-        const c = await getStripeCustomer(customerId);
-        return c?.email || fallback || "Sin email";
-      } catch {
-        return fallback || "Sin email";
-      }
-    };
+    // Bloque de 4 campos (Cliente + Payer) reusable.
+    const buildClientPayerFields = ({
+      customerName,
+      customerEmail,
+      payerName,
+      payerEmail,
+    }) => [
+      { type: "mrkdwn", text: `*Nombre del cliente:*\n${customerName || "—"}` },
+      { type: "mrkdwn", text: `*Email del cliente:*\n${customerEmail || "—"}` },
+      { type: "mrkdwn", text: `*Nombre de quien paga:*\n${payerName || "—"}` },
+      { type: "mrkdwn", text: `*Email de quien paga:*\n${payerEmail || "—"}` },
+    ];
 
     // ========== CHARGE.SUCCEEDED ==========
     if (event.type === "charge.succeeded") {
       const charge = event.data.object;
-      const name = await resolveCustomerName(charge.customer);
-      const email =
+      const customer = await fetchCustomer(charge.customer);
+
+      const customerName = customer?.name || "Sin nombre";
+      const customerEmail = customer?.email || "Sin email";
+      const payerName = charge.billing_details?.name || "Sin nombre";
+      const payerEmail =
         charge.billing_details?.email ||
         charge.receipt_email ||
         "Sin email";
+
       const amount = (charge.amount / 100).toFixed(2);
       const currency = charge.currency.toUpperCase();
       const chargeId = charge.id;
@@ -196,9 +208,16 @@ export default async function handler(req, res) {
           },
           {
             type: "section",
+            fields: buildClientPayerFields({
+              customerName,
+              customerEmail,
+              payerName,
+              payerEmail,
+            }),
+          },
+          {
+            type: "section",
             fields: [
-              { type: "mrkdwn", text: `*Nombre:*\n${name}` },
-              { type: "mrkdwn", text: `*Email:*\n${email}` },
               { type: "mrkdwn", text: `*Monto:*\n${amount} ${currency}` },
               { type: "mrkdwn", text: `*Método:*\n${paymentMethod}` },
               { type: "mrkdwn", text: `*Descripción:*\n${description}` },
@@ -224,12 +243,21 @@ export default async function handler(req, res) {
     // ========== CHARGE.DISPUTE.CREATED ==========
     else if (event.type === "charge.dispute.created") {
       const dispute = event.data.object;
-      // El dispute no trae customer directamente; intentamos via charge expandido si está
-      const customerId =
-        typeof dispute.charge === "object"
-          ? dispute.charge?.customer
-          : null;
-      const name = await resolveCustomerName(customerId);
+      const chargeCustomerId =
+        typeof dispute.charge === "object" ? dispute.charge?.customer : null;
+      const customer = await fetchCustomer(chargeCustomerId);
+
+      const customerName = customer?.name || "Sin nombre";
+      const customerEmail = customer?.email || "Sin email";
+      const payerName =
+        (typeof dispute.charge === "object" &&
+          dispute.charge?.billing_details?.name) ||
+        "Sin nombre";
+      const payerEmail =
+        (typeof dispute.charge === "object" &&
+          (dispute.charge?.billing_details?.email ||
+            dispute.charge?.receipt_email)) ||
+        "Sin email";
 
       const amount = (dispute.amount / 100).toFixed(2);
       const currency = dispute.currency.toUpperCase();
@@ -251,8 +279,16 @@ export default async function handler(req, res) {
           },
           {
             type: "section",
+            fields: buildClientPayerFields({
+              customerName,
+              customerEmail,
+              payerName,
+              payerEmail,
+            }),
+          },
+          {
+            type: "section",
             fields: [
-              { type: "mrkdwn", text: `*Nombre:*\n${name}` },
               { type: "mrkdwn", text: `*Monto disputado:*\n${amount} ${currency}` },
               { type: "mrkdwn", text: `*Razón:*\n${reason}` },
               { type: "mrkdwn", text: `*Estado:*\n${status}` },
@@ -277,11 +313,16 @@ export default async function handler(req, res) {
       event.type === "checkout.session.expired"
     ) {
       const session = event.data.object;
-      const name = await resolveCustomerName(session.customer);
-      const email =
+      const customer = await fetchCustomer(session.customer);
+
+      const customerName = customer?.name || "Sin nombre";
+      const customerEmail = customer?.email || "Sin email";
+      const payerName = session.customer_details?.name || "Sin nombre";
+      const payerEmail =
         session.customer_details?.email ||
         session.customer_email ||
         "Sin email";
+
       const amount = ((session.amount_total ?? 0) / 100).toFixed(2);
       const currency = (session.currency || "usd").toUpperCase();
       const mode = session.mode || "payment";
@@ -303,9 +344,16 @@ export default async function handler(req, res) {
           },
           {
             type: "section",
+            fields: buildClientPayerFields({
+              customerName,
+              customerEmail,
+              payerName,
+              payerEmail,
+            }),
+          },
+          {
+            type: "section",
             fields: [
-              { type: "mrkdwn", text: `*Nombre:*\n${name}` },
-              { type: "mrkdwn", text: `*Email:*\n${email}` },
               { type: "mrkdwn", text: `*Monto:*\n${amount} ${currency}` },
               { type: "mrkdwn", text: `*Modo:*\n${mode}` },
               { type: "mrkdwn", text: `*Estado pago:*\n${paymentStatus}` },
@@ -333,8 +381,11 @@ export default async function handler(req, res) {
       event.type === "customer.subscription.paused"
     ) {
       const sub = event.data.object;
-      const name = await resolveCustomerName(sub.customer);
-      const email = await resolveCustomerEmail(sub.customer, null);
+      const customer = await fetchCustomer(sub.customer);
+
+      const customerName = customer?.name || "Sin nombre";
+      const customerEmail = customer?.email || "Sin email";
+
       const status = sub.status || "—";
       const item = sub.items?.data?.[0];
       const price = item?.price;
@@ -366,13 +417,10 @@ export default async function handler(req, res) {
           {
             type: "section",
             fields: [
-              { type: "mrkdwn", text: `*Nombre:*\n${name}` },
-              { type: "mrkdwn", text: `*Email:*\n${email}` },
+              { type: "mrkdwn", text: `*Nombre del cliente:*\n${customerName}` },
+              { type: "mrkdwn", text: `*Email del cliente:*\n${customerEmail}` },
               { type: "mrkdwn", text: `*Plan:*\n${productName}` },
-              {
-                type: "mrkdwn",
-                text: `*Precio:*\n${amount} ${currency} / ${interval}`,
-              },
+              { type: "mrkdwn", text: `*Precio:*\n${amount} ${currency} / ${interval}` },
               { type: "mrkdwn", text: `*Estado:*\n${status}` },
               { type: "mrkdwn", text: `*Próxima renovación:*\n${periodEnd}` },
             ],
@@ -398,10 +446,14 @@ export default async function handler(req, res) {
       event.type === "invoice.payment_failed"
     ) {
       const invoice = event.data.object;
-      const name = await resolveCustomerName(invoice.customer);
-      const email =
-        invoice.customer_email ||
-        (await resolveCustomerEmail(invoice.customer, null));
+      const customer = await fetchCustomer(invoice.customer);
+
+      const customerName = customer?.name || invoice.customer_name || "Sin nombre";
+      const customerEmail = customer?.email || invoice.customer_email || "Sin email";
+      // Invoice no tiene un "payer" separado a nivel del objeto; usamos el snapshot que Stripe guarda en la invoice.
+      const payerName = invoice.customer_name || "—";
+      const payerEmail = invoice.customer_email || "—";
+
       const amount = (
         (invoice.amount_paid ?? invoice.amount_due ?? 0) / 100
       ).toFixed(2);
@@ -432,9 +484,16 @@ export default async function handler(req, res) {
           },
           {
             type: "section",
+            fields: buildClientPayerFields({
+              customerName,
+              customerEmail,
+              payerName,
+              payerEmail,
+            }),
+          },
+          {
+            type: "section",
             fields: [
-              { type: "mrkdwn", text: `*Nombre:*\n${name}` },
-              { type: "mrkdwn", text: `*Email:*\n${email}` },
               { type: "mrkdwn", text: `*Monto:*\n${amount} ${currency}` },
               { type: "mrkdwn", text: `*Estado:*\n${status}` },
               { type: "mrkdwn", text: `*N° factura:*\n${number}` },
