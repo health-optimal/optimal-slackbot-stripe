@@ -1,13 +1,7 @@
-const crypto = require("crypto");
-const https = require("https");
-const { URL } = require("url");
+import crypto from "node:crypto";
+import https from "node:https";
+import { URL } from "node:url";
 
-/**
- * Vercel Serverless Function: recibe eventos de Stripe y los postea a Slack
- * con nombre, email y monto del cliente.
- */
-
-// Necesitamos el raw body para verificar la firma de Stripe
 export const config = {
   api: {
     bodyParser: false,
@@ -25,10 +19,6 @@ function getRawBody(req) {
   });
 }
 
-/**
- * Verifica la firma de Stripe sin usar la librería oficial.
- * Stripe manda un header con formato: t=<ts>,v1=<sig>,v0=<sig>
- */
 function verifyStripeSignature(payload, header, secret) {
   if (!secret) throw new Error("STRIPE_WEBHOOK_SECRET no configurado");
   if (!header) throw new Error("Falta header stripe-signature");
@@ -44,7 +34,6 @@ function verifyStripeSignature(payload, header, secret) {
   const v1 = parts.v1;
   if (!timestamp || !v1) throw new Error("Header de firma inválido");
 
-  // Tolerancia de 5 minutos contra replay
   const now = Math.floor(Date.now() / 1000);
   if (Math.abs(now - Number(timestamp)) > 300) {
     throw new Error("Timestamp fuera de tolerancia");
@@ -65,9 +54,6 @@ function verifyStripeSignature(payload, header, secret) {
   return JSON.parse(payload);
 }
 
-/**
- * Helper genérico para hacer requests HTTPS sin dependencias externas.
- */
 function httpsRequest(options, body) {
   return new Promise((resolve, reject) => {
     const req = https.request(options, (res) => {
@@ -82,9 +68,6 @@ function httpsRequest(options, body) {
   });
 }
 
-/**
- * Obtiene el Customer de Stripe vía REST API.
- */
 async function getStripeCustomer(customerId) {
   const key = process.env.STRIPE_SECRET_KEY;
   if (!key) throw new Error("STRIPE_SECRET_KEY no configurado");
@@ -93,20 +76,13 @@ async function getStripeCustomer(customerId) {
     hostname: "api.stripe.com",
     path: `/v1/customers/${encodeURIComponent(customerId)}`,
     method: "GET",
-    headers: {
-      Authorization: `Bearer ${key}`,
-    },
+    headers: { Authorization: `Bearer ${key}` },
   });
 
-  if (status >= 400) {
-    throw new Error(`Stripe API ${status}: ${body}`);
-  }
+  if (status >= 400) throw new Error(`Stripe API ${status}: ${body}`);
   return JSON.parse(body);
 }
 
-/**
- * Postea un mensaje (con blocks) a un Incoming Webhook de Slack.
- */
 async function postToSlack(message) {
   const webhookUrl = process.env.SLACK_WEBHOOK_URL;
   if (!webhookUrl) throw new Error("SLACK_WEBHOOK_URL no configurado");
@@ -127,12 +103,10 @@ async function postToSlack(message) {
     payload
   );
 
-  if (status >= 400) {
-    throw new Error(`Slack webhook ${status}: ${body}`);
-  }
+  if (status >= 400) throw new Error(`Slack webhook ${status}: ${body}`);
 }
 
-// ---------- Handler principal ----------
+// ---------- Handler ----------
 
 export default async function handler(req, res) {
   if (req.method !== "POST") {
@@ -164,7 +138,6 @@ export default async function handler(req, res) {
     if (event.type === "charge.succeeded") {
       const charge = event.data.object;
 
-      // Nombre: priorizar el del Customer en Stripe, fallback a billing_details
       let name = charge.billing_details?.name || "Sin nombre";
       if (charge.customer) {
         try {
@@ -232,7 +205,6 @@ export default async function handler(req, res) {
         );
       } catch (err) {
         console.error("Error posteando a Slack:", err.message);
-        // Igual respondemos 200 para que Stripe no reintente en loop
       }
     } else {
       console.log(`Evento ignorado: ${event.type}`);
