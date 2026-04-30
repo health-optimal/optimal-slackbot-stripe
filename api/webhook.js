@@ -90,6 +90,21 @@ async function getStripeCustomer(customerId) {
   return JSON.parse(body);
 }
 
+async function getStripeCharge(chargeId) {
+  const key = process.env.STRIPE_SECRET_KEY;
+  if (!key) throw new Error("STRIPE_SECRET_KEY no configurado");
+
+  const { status, body } = await httpsRequest({
+    hostname: "api.stripe.com",
+    path: `/v1/charges/${encodeURIComponent(chargeId)}`,
+    method: "GET",
+    headers: { Authorization: `Bearer ${key}` },
+  });
+
+  if (status >= 400) throw new Error(`Stripe API ${status}: ${body}`);
+  return JSON.parse(body);
+}
+
 async function postToSlack(message) {
   const webhookUrl = process.env.SLACK_WEBHOOK_URL;
   if (!webhookUrl) throw new Error("SLACK_WEBHOOK_URL no configurado");
@@ -140,15 +155,18 @@ export default async function handler(req, res) {
   }
 
   try {
-    let slackMessage = null;
+    // Solo procesamos charge.succeeded y charge.dispute.created.
+    const handledTypes = ["charge.succeeded", "charge.dispute.created"];
+    if (!handledTypes.includes(event.type)) {
+      console.log(`Evento ignorado: ${event.type}`);
+      return res.status(200).json({ received: true });
+    }
 
     const fmtDate = (unixSec) =>
       new Date(
         (unixSec || Math.floor(Date.now() / 1000)) * 1000
       ).toLocaleString("es-PE", { timeZone: "America/Lima" });
 
-    // Trae el Customer completo de Stripe con logging defensivo.
-    // Devuelve null si no hay customerId o si la API falla.
     const fetchCustomer = async (customerId) => {
       if (!customerId) {
         console.log("fetchCustomer: customerId vacío");
@@ -166,7 +184,6 @@ export default async function handler(req, res) {
       }
     };
 
-    // Bloque de 4 campos (Cliente + Payer) reusable.
     const buildClientPayerFields = ({
       customerName,
       customerEmail,
@@ -178,6 +195,8 @@ export default async function handler(req, res) {
       { type: "mrkdwn", text: `*Nombre de quien paga:*\n${payerName || "—"}` },
       { type: "mrkdwn", text: `*Email de quien paga:*\n${payerEmail || "—"}` },
     ];
+
+    let slackMessage = null;
 
     // ========== CHARGE.SUCCEEDED ==========
     if (event.type === "charge.succeeded") {
@@ -243,30 +262,39 @@ export default async function handler(req, res) {
     // ========== CHARGE.DISPUTE.CREATED ==========
     else if (event.type === "charge.dispute.created") {
       const dispute = event.data.object;
-      const chargeCustomerId =
-        typeof dispute.charge === "object" ? dispute.charge?.customer : null;
-      const customer = await fetchCustomer(chargeCustomerId);
+
+      // dispute.charge suele venir como string (charge id). Lo expandimos
+      // contra la API para poder mostrar billing_details y customer info.
+      const chargeId =
+        typeof dispute.charge === "string"
+          ? dispute.charge
+          : dispute.charge?.id || null;
+
+      let charge = null;
+      if (typeof dispute.charge === "object" && dispute.charge !== null) {
+        charge = dispute.charge;
+      } else if (chargeId) {
+        try {
+          charge = await getStripeCharge(chargeId);
+        } catch (err) {
+          console.error(`getStripeCharge FAIL: id=${chargeId} err=${err.message}`);
+        }
+      }
+
+      const customer = await fetchCustomer(charge?.customer);
 
       const customerName = customer?.name || "Sin nombre";
       const customerEmail = customer?.email || "Sin email";
-      const payerName =
-        (typeof dispute.charge === "object" &&
-          dispute.charge?.billing_details?.name) ||
-        "Sin nombre";
+      const payerName = charge?.billing_details?.name || "Sin nombre";
       const payerEmail =
-        (typeof dispute.charge === "object" &&
-          (dispute.charge?.billing_details?.email ||
-            dispute.charge?.receipt_email)) ||
+        charge?.billing_details?.email ||
+        charge?.receipt_email ||
         "Sin email";
 
       const amount = (dispute.amount / 100).toFixed(2);
       const currency = dispute.currency.toUpperCase();
       const reason = dispute.reason || "no especificada";
       const status = dispute.status || "needs_response";
-      const chargeId =
-        typeof dispute.charge === "string"
-          ? dispute.charge
-          : dispute.charge?.id || "—";
       const dueBy = dispute.evidence_details?.due_by
         ? fmtDate(dispute.evidence_details.due_by)
         : "—";
@@ -293,7 +321,7 @@ export default async function handler(req, res) {
               { type: "mrkdwn", text: `*Razón:*\n${reason}` },
               { type: "mrkdwn", text: `*Estado:*\n${status}` },
               { type: "mrkdwn", text: `*Evidencia hasta:*\n${dueBy}` },
-              { type: "mrkdwn", text: `*Charge:*\n\`${chargeId}\`` },
+              { type: "mrkdwn", text: `*Charge:*\n\`${chargeId || "—"}\`` },
             ],
           },
           {
@@ -303,223 +331,6 @@ export default async function handler(req, res) {
           { type: "divider" },
         ],
       };
-    }
-
-    // ========== CHECKOUT.SESSION.* ==========
-    else if (
-      event.type === "checkout.session.completed" ||
-      event.type === "checkout.session.async_payment_succeeded" ||
-      event.type === "checkout.session.async_payment_failed" ||
-      event.type === "checkout.session.expired"
-    ) {
-      const session = event.data.object;
-      const customer = await fetchCustomer(session.customer);
-
-      const customerName = customer?.name || "Sin nombre";
-      const customerEmail = customer?.email || "Sin email";
-      const payerName = session.customer_details?.name || "Sin nombre";
-      const payerEmail =
-        session.customer_details?.email ||
-        session.customer_email ||
-        "Sin email";
-
-      const amount = ((session.amount_total ?? 0) / 100).toFixed(2);
-      const currency = (session.currency || "usd").toUpperCase();
-      const mode = session.mode || "payment";
-      const paymentStatus = session.payment_status || "unknown";
-
-      let header = "✅ Checkout completado";
-      if (event.type === "checkout.session.async_payment_succeeded")
-        header = "✅ Pago asíncrono confirmado";
-      if (event.type === "checkout.session.async_payment_failed")
-        header = "❌ Pago asíncrono falló";
-      if (event.type === "checkout.session.expired")
-        header = "⌛ Checkout expirado";
-
-      slackMessage = {
-        blocks: [
-          {
-            type: "header",
-            text: { type: "plain_text", text: header, emoji: true },
-          },
-          {
-            type: "section",
-            fields: buildClientPayerFields({
-              customerName,
-              customerEmail,
-              payerName,
-              payerEmail,
-            }),
-          },
-          {
-            type: "section",
-            fields: [
-              { type: "mrkdwn", text: `*Monto:*\n${amount} ${currency}` },
-              { type: "mrkdwn", text: `*Modo:*\n${mode}` },
-              { type: "mrkdwn", text: `*Estado pago:*\n${paymentStatus}` },
-              { type: "mrkdwn", text: `*Fecha:*\n${fmtDate(session.created)}` },
-            ],
-          },
-          {
-            type: "context",
-            elements: [
-              {
-                type: "mrkdwn",
-                text: `\`Session: ${session.id}\` • \`Event: ${event.type}\``,
-              },
-            ],
-          },
-          { type: "divider" },
-        ],
-      };
-    }
-
-    // ========== CUSTOMER.SUBSCRIPTION.* ==========
-    else if (
-      event.type === "customer.subscription.created" ||
-      event.type === "customer.subscription.deleted" ||
-      event.type === "customer.subscription.paused"
-    ) {
-      const sub = event.data.object;
-      const customer = await fetchCustomer(sub.customer);
-
-      const customerName = customer?.name || "Sin nombre";
-      const customerEmail = customer?.email || "Sin email";
-
-      const status = sub.status || "—";
-      const item = sub.items?.data?.[0];
-      const price = item?.price;
-      const amount =
-        price?.unit_amount != null
-          ? (price.unit_amount / 100).toFixed(2)
-          : "—";
-      const currency = (price?.currency || "usd").toUpperCase();
-      const interval = price?.recurring?.interval
-        ? `${price.recurring.interval_count || 1}/${price.recurring.interval}`
-        : "—";
-      const productName = item?.price?.nickname || price?.product || "—";
-      const periodEnd = sub.current_period_end
-        ? fmtDate(sub.current_period_end)
-        : "—";
-
-      let header = "🆕 Suscripción creada";
-      if (event.type === "customer.subscription.deleted")
-        header = "🗑️ Suscripción cancelada";
-      if (event.type === "customer.subscription.paused")
-        header = "⏸️ Suscripción pausada";
-
-      slackMessage = {
-        blocks: [
-          {
-            type: "header",
-            text: { type: "plain_text", text: header, emoji: true },
-          },
-          {
-            type: "section",
-            fields: [
-              { type: "mrkdwn", text: `*Nombre del cliente:*\n${customerName}` },
-              { type: "mrkdwn", text: `*Email del cliente:*\n${customerEmail}` },
-              { type: "mrkdwn", text: `*Plan:*\n${productName}` },
-              { type: "mrkdwn", text: `*Precio:*\n${amount} ${currency} / ${interval}` },
-              { type: "mrkdwn", text: `*Estado:*\n${status}` },
-              { type: "mrkdwn", text: `*Próxima renovación:*\n${periodEnd}` },
-            ],
-          },
-          {
-            type: "context",
-            elements: [
-              {
-                type: "mrkdwn",
-                text: `\`Subscription: ${sub.id}\` • \`Customer: ${sub.customer}\``,
-              },
-            ],
-          },
-          { type: "divider" },
-        ],
-      };
-    }
-
-    // ========== INVOICE.* ==========
-    else if (
-      event.type === "invoice.paid" ||
-      event.type === "invoice.payment_succeeded" ||
-      event.type === "invoice.payment_failed"
-    ) {
-      const invoice = event.data.object;
-      const customer = await fetchCustomer(invoice.customer);
-
-      const customerName = customer?.name || invoice.customer_name || "Sin nombre";
-      const customerEmail = customer?.email || invoice.customer_email || "Sin email";
-      // Invoice no tiene un "payer" separado a nivel del objeto; usamos el snapshot que Stripe guarda en la invoice.
-      const payerName = invoice.customer_name || "—";
-      const payerEmail = invoice.customer_email || "—";
-
-      const amount = (
-        (invoice.amount_paid ?? invoice.amount_due ?? 0) / 100
-      ).toFixed(2);
-      const currency = (invoice.currency || "usd").toUpperCase();
-      const status = invoice.status || "—";
-      const number = invoice.number || invoice.id;
-      const hostedUrl = invoice.hosted_invoice_url || null;
-      const pdf = invoice.invoice_pdf || null;
-
-      let header = "🧾 Factura pagada";
-      if (event.type === "invoice.payment_succeeded")
-        header = "✅ Pago de factura confirmado";
-      if (event.type === "invoice.payment_failed")
-        header = "❌ Pago de factura falló";
-
-      const links = [
-        hostedUrl ? `<${hostedUrl}|Ver factura>` : null,
-        pdf ? `<${pdf}|PDF>` : null,
-      ]
-        .filter(Boolean)
-        .join(" • ");
-
-      slackMessage = {
-        blocks: [
-          {
-            type: "header",
-            text: { type: "plain_text", text: header, emoji: true },
-          },
-          {
-            type: "section",
-            fields: buildClientPayerFields({
-              customerName,
-              customerEmail,
-              payerName,
-              payerEmail,
-            }),
-          },
-          {
-            type: "section",
-            fields: [
-              { type: "mrkdwn", text: `*Monto:*\n${amount} ${currency}` },
-              { type: "mrkdwn", text: `*Estado:*\n${status}` },
-              { type: "mrkdwn", text: `*N° factura:*\n${number}` },
-              { type: "mrkdwn", text: `*Fecha:*\n${fmtDate(invoice.created)}` },
-            ],
-          },
-          ...(links
-            ? [{ type: "context", elements: [{ type: "mrkdwn", text: links }] }]
-            : []),
-          {
-            type: "context",
-            elements: [
-              {
-                type: "mrkdwn",
-                text: `\`Invoice: ${invoice.id}\` • \`Event: ${event.type}\``,
-              },
-            ],
-          },
-          { type: "divider" },
-        ],
-      };
-    }
-
-    // ========== Cualquier otro evento ==========
-    else {
-      console.log(`Evento ignorado: ${event.type}`);
     }
 
     if (slackMessage) {
