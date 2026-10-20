@@ -19,8 +19,11 @@ function getRawBody(req) {
   });
 }
 
-function verifyStripeSignature(payload, header, secret) {
-  if (!secret) throw new Error("STRIPE_WEBHOOK_SECRET no configurado");
+// Firma contra varios secrets (uno por cuenta Stripe). El que verifique
+// determina la entidad de cobro que envió el evento.
+//   STRIPE_WEBHOOK_SECRET      -> 'us'  (Optimal US, legacy/default)
+//   STRIPE_WEBHOOK_SECRET_MX   -> 'mx'  (Optimal MEX)
+function verifyStripeSignature(payload, header) {
   if (!header) throw new Error("Falta header stripe-signature");
 
   const parts = Object.fromEntries(
@@ -39,20 +42,51 @@ function verifyStripeSignature(payload, header, secret) {
     throw new Error("Timestamp fuera de tolerancia");
   }
 
-  const signedPayload = `${timestamp}.${payload}`;
-  const expected = crypto
-    .createHmac("sha256", secret)
-    .update(signedPayload, "utf8")
-    .digest("hex");
+  const secrets = [
+    ["us", process.env.STRIPE_WEBHOOK_SECRET],
+    ["mx", process.env.STRIPE_WEBHOOK_SECRET_MX],
+  ].filter(([, s]) => Boolean(s));
 
-  const a = Buffer.from(expected, "hex");
-  const b = Buffer.from(v1, "hex");
-  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
-    throw new Error("Firma no coincide");
+  if (secrets.length === 0) {
+    throw new Error("STRIPE_WEBHOOK_SECRET no configurado");
   }
 
-  return JSON.parse(payload);
+  const signedPayload = `${timestamp}.${payload}`;
+  const provided = Buffer.from(v1, "hex");
+
+  for (const [entity, secret] of secrets) {
+    const expected = crypto
+      .createHmac("sha256", secret)
+      .update(signedPayload, "utf8")
+      .digest("hex");
+    const a = Buffer.from(expected, "hex");
+    if (
+      a.length === provided.length &&
+      crypto.timingSafeEqual(a, provided)
+    ) {
+      return { event: JSON.parse(payload), entity };
+    }
+  }
+
+  throw new Error("Firma no coincide");
 }
+
+// API key por entidad: la cuenta MX tiene sus propios customers/charges.
+function stripeSecretKeyFor(entity) {
+  if (entity === "mx") {
+    const k = process.env.STRIPE_SECRET_KEY_MX;
+    if (!k) throw new Error("STRIPE_SECRET_KEY_MX no configurado");
+    return k;
+  }
+  const k = process.env.STRIPE_SECRET_KEY || process.env.STRIPE_SECRET_KEY_US;
+  if (!k) throw new Error("STRIPE_SECRET_KEY no configurado");
+  return k;
+}
+
+const ENTITY_LABELS = {
+  us: "Optimal US",
+  mx: "Optimal MEX",
+};
 
 function httpsRequest({ hostname, path, method, headers, payload }) {
   return new Promise((resolve, reject) => {
@@ -75,30 +109,25 @@ function httpsRequest({ hostname, path, method, headers, payload }) {
   });
 }
 
-async function getStripeCustomer(customerId) {
-  const key = process.env.STRIPE_SECRET_KEY;
-  if (!key) throw new Error("STRIPE_SECRET_KEY no configurado");
-
+async function getStripeCustomer(customerId, secretKey) {
+  if (!customerId) return null;
   const { status, body } = await httpsRequest({
     hostname: "api.stripe.com",
     path: `/v1/customers/${encodeURIComponent(customerId)}`,
     method: "GET",
-    headers: { Authorization: `Bearer ${key}` },
+    headers: { Authorization: `Bearer ${secretKey}` },
   });
 
   if (status >= 400) throw new Error(`Stripe API ${status}: ${body}`);
   return JSON.parse(body);
 }
 
-async function getStripeCharge(chargeId) {
-  const key = process.env.STRIPE_SECRET_KEY;
-  if (!key) throw new Error("STRIPE_SECRET_KEY no configurado");
-
+async function getStripeCharge(chargeId, secretKey) {
   const { status, body } = await httpsRequest({
     hostname: "api.stripe.com",
     path: `/v1/charges/${encodeURIComponent(chargeId)}`,
     method: "GET",
-    headers: { Authorization: `Bearer ${key}` },
+    headers: { Authorization: `Bearer ${secretKey}` },
   });
 
   if (status >= 400) throw new Error(`Stripe API ${status}: ${body}`);
@@ -141,18 +170,29 @@ export default async function handler(req, res) {
   const rawBody = await getRawBody(req);
 
   let event;
+  let entityFromWebhook;
   try {
-    event = verifyStripeSignature(
+    ({ event, entity: entityFromWebhook } = verifyStripeSignature(
       rawBody.toString("utf8"),
-      signature,
-      process.env.STRIPE_WEBHOOK_SECRET
-    );
+      signature
+    ));
   } catch (err) {
     console.error("Signature verification failed:", err.message);
     return res
       .status(400)
       .send(`Webhook signature verification failed: ${err.message}`);
   }
+
+  // La entidad de cobro viene del metadata que pone ops-pilot al crear el
+  // intent (metadata.billing_entity = 'us' | 'mx'); si no viene, usamos la
+  // cuenta que firmó el webhook.
+  const billingEntity =
+    event.data?.object?.metadata?.billing_entity || entityFromWebhook || "us";
+  const entityLabel = ENTITY_LABELS[billingEntity] || ENTITY_LABELS.us;
+  const secretKey = stripeSecretKeyFor(billingEntity);
+  console.log(
+    `Evento ${event.type} entidad=${billingEntity} (webhook=${entityFromWebhook})`
+  );
 
   try {
     // Solo procesamos charge.succeeded y charge.dispute.created.
@@ -173,7 +213,7 @@ export default async function handler(req, res) {
         return null;
       }
       try {
-        const c = await getStripeCustomer(customerId);
+        const c = await getStripeCustomer(customerId, secretKey);
         console.log(
           `fetchCustomer OK: id=${customerId} name=${c?.name || "(vacío)"} email=${c?.email || "(vacío)"}`
         );
@@ -189,7 +229,9 @@ export default async function handler(req, res) {
       customerEmail,
       payerName,
       payerEmail,
+      entityLabel,
     }) => [
+      { type: "mrkdwn", text: `*Entidad de cobro:\\n${entityLabel || "—"}` },
       { type: "mrkdwn", text: `*Nombre del cliente:*\n${customerName || "—"}` },
       { type: "mrkdwn", text: `*Email del cliente:*\n${customerEmail || "—"}` },
       { type: "mrkdwn", text: `*Nombre de quien paga:*\n${payerName || "—"}` },
@@ -232,6 +274,7 @@ export default async function handler(req, res) {
               customerEmail,
               payerName,
               payerEmail,
+              entityLabel,
             }),
           },
           {
@@ -275,7 +318,7 @@ export default async function handler(req, res) {
         charge = dispute.charge;
       } else if (chargeId) {
         try {
-          charge = await getStripeCharge(chargeId);
+          charge = await getStripeCharge(chargeId, secretKey);
         } catch (err) {
           console.error(`getStripeCharge FAIL: id=${chargeId} err=${err.message}`);
         }
@@ -312,6 +355,7 @@ export default async function handler(req, res) {
               customerEmail,
               payerName,
               payerEmail,
+              entityLabel,
             }),
           },
           {
