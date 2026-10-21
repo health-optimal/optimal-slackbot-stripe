@@ -231,7 +231,7 @@ export default async function handler(req, res) {
       payerEmail,
       entityLabel,
     }) => [
-      { type: "mrkdwn", text: `*Entidad de cobro:\\n${entityLabel || "—"}` },
+      { type: "mrkdwn", text: `*Entidad de cobro:\n${entityLabel || "—"}` },
       { type: "mrkdwn", text: `*Nombre del cliente:*\n${customerName || "—"}` },
       { type: "mrkdwn", text: `*Email del cliente:*\n${customerEmail || "—"}` },
       { type: "mrkdwn", text: `*Nombre de quien paga:*\n${payerName || "—"}` },
