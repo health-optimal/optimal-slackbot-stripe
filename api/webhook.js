@@ -105,7 +105,7 @@ function originFields(meta) {
     { type: "mrkdwn", text: `*Plan:*\n${meta.plan || "—"}` },
     { type: "mrkdwn", text: `*País:*\n${COUNTRY_LABELS[country] || meta.country || "—"}` },
     { type: "mrkdwn", text: `*WhatsApp:*\n${digits ? `<https://wa.me/${digits}|+${digits}>` : "—"}` },
-    { type: "mrkdwn", text: `*Folio:*\n${meta.lead_ref || "—"}` },
+    { type: "mrkdwn", text: `*Ref:*\n${meta.lead_ref || "—"}` },
   ];
 }
 
