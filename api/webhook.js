@@ -88,6 +88,27 @@ const ENTITY_LABELS = {
   mx: "Optimal MEX",
 };
 
+// Cobros de los sitios (Core/Apex): el checkout deja los datos del paciente en
+// payment_intent_data.metadata (origin, plan, country, name, phone, lead_ref).
+const ORIGIN_LABELS = {
+  optimal_web: "<https://www.optimal.lat|Optimal Web>",
+  hotbook: "<https://www.optimal.lat/hotbook|Hotbook>",
+};
+const COUNTRY_LABELS = { MX: "México", CO: "Colombia", PE: "Perú", US: "Estados Unidos" };
+
+function originFields(meta) {
+  if (!meta || !meta.origin) return null;
+  const digits = String(meta.phone || "").replace(/\D/g, "");
+  const country = String(meta.country || "").toUpperCase();
+  return [
+    { type: "mrkdwn", text: `*Origen:*\n${ORIGIN_LABELS[meta.origin] || meta.origin}` },
+    { type: "mrkdwn", text: `*Plan:*\n${meta.plan || "—"}` },
+    { type: "mrkdwn", text: `*País:*\n${COUNTRY_LABELS[country] || meta.country || "—"}` },
+    { type: "mrkdwn", text: `*WhatsApp:*\n${digits ? `<https://wa.me/${digits}|+${digits}>` : "—"}` },
+    { type: "mrkdwn", text: `*Folio:*\n${meta.lead_ref || "—"}` },
+  ];
+}
+
 function httpsRequest({ hostname, path, method, headers, payload }) {
   return new Promise((resolve, reject) => {
     const req = https.request(
@@ -231,7 +252,7 @@ export default async function handler(req, res) {
       payerEmail,
       entityLabel,
     }) => [
-      { type: "mrkdwn", text: `*Entidad de cobro:\n${entityLabel || "—"}` },
+      { type: "mrkdwn", text: `*Entidad de cobro:*\n${entityLabel || "—"}` },
       { type: "mrkdwn", text: `*Nombre del cliente:*\n${customerName || "—"}` },
       { type: "mrkdwn", text: `*Email del cliente:*\n${customerEmail || "—"}` },
       { type: "mrkdwn", text: `*Nombre de quien paga:*\n${payerName || "—"}` },
@@ -244,8 +265,9 @@ export default async function handler(req, res) {
     if (event.type === "charge.succeeded") {
       const charge = event.data.object;
       const customer = await fetchCustomer(charge.customer);
+      const origin = originFields(charge.metadata);
 
-      const customerName = customer?.name || "Sin nombre";
+      const customerName = customer?.name || charge.metadata?.name || "Sin nombre";
       const customerEmail = customer?.email || "Sin email";
       const payerName = charge.billing_details?.name || "Sin nombre";
       const payerEmail =
@@ -277,6 +299,7 @@ export default async function handler(req, res) {
               entityLabel,
             }),
           },
+          ...(origin ? [{ type: "section", fields: origin }] : []),
           {
             type: "section",
             fields: [
