@@ -89,7 +89,7 @@ const ENTITY_LABELS = {
 };
 
 // Cobros de los sitios (Core/Apex): el checkout deja los datos del paciente en
-// payment_intent_data.metadata (origin, plan, country, name, phone, lead_ref).
+// payment_intent_data.metadata (origin, plan, country, name, phone).
 const ORIGIN_LABELS = {
   optimal_web: "<https://www.optimal.lat|Optimal Web>",
   hotbook: "<https://www.optimal.lat/hotbook|Hotbook>",
@@ -105,7 +105,6 @@ function originFields(meta) {
     { type: "mrkdwn", text: `*Plan:*\n${meta.plan || "—"}` },
     { type: "mrkdwn", text: `*País:*\n${COUNTRY_LABELS[country] || meta.country || "—"}` },
     { type: "mrkdwn", text: `*WhatsApp:*\n${digits ? `<https://wa.me/${digits}|+${digits}>` : "—"}` },
-    { type: "mrkdwn", text: `*Ref:*\n${meta.lead_ref || "—"}` },
   ];
 }
 
