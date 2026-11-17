@@ -1,6 +1,8 @@
 import crypto from "node:crypto";
 import https from "node:https";
 import { URL } from "node:url";
+import { discountFields, escapeMrkdwn, sessionDiscount, sessionLookupPath } from "../lib/discount.js";
+import { leadsPaymentText } from "../lib/leads.js";
 
 export const config = {
   api: {
@@ -108,7 +110,7 @@ function originFields(meta) {
   ];
 }
 
-function httpsRequest({ hostname, path, method, headers, payload }) {
+function httpsRequest({ hostname, path, method, headers, payload, timeoutMs }) {
   return new Promise((resolve, reject) => {
     const req = https.request(
       { hostname, path, method, headers },
@@ -124,6 +126,7 @@ function httpsRequest({ hostname, path, method, headers, payload }) {
       }
     );
     req.on("error", reject);
+    if (timeoutMs) req.setTimeout(timeoutMs, () => req.destroy(new Error(`sin respuesta en ${timeoutMs} ms`)));
     if (payload) req.write(payload);
     req.end();
   });
@@ -154,8 +157,23 @@ async function getStripeCharge(chargeId, secretKey) {
   return JSON.parse(body);
 }
 
-async function postToSlack(message) {
-  const webhookUrl = process.env.SLACK_WEBHOOK_URL;
+// La sesión de Checkout de un cobro (null si el cobro no nació de un Checkout). Con tope de tiempo: es un dato
+// informativo y no puede consumir el plazo de la función (vercel.json) antes de que salga el aviso.
+const SESSION_LOOKUP_TIMEOUT_MS = 3000;
+async function getCheckoutSession(paymentIntentId, secretKey) {
+  const { status, body } = await httpsRequest({
+    hostname: "api.stripe.com",
+    path: sessionLookupPath(paymentIntentId),
+    method: "GET",
+    headers: { Authorization: `Bearer ${secretKey}` },
+    timeoutMs: SESSION_LOOKUP_TIMEOUT_MS,
+  });
+
+  if (status >= 400) throw new Error(`Stripe API ${status}: ${body}`);
+  return JSON.parse(body).data?.[0] || null;
+}
+
+async function postToSlack(message, webhookUrl = process.env.SLACK_WEBHOOK_URL) {
   if (!webhookUrl) throw new Error("SLACK_WEBHOOK_URL no configurado");
 
   const url = new URL(webhookUrl);
@@ -259,12 +277,28 @@ export default async function handler(req, res) {
     ];
 
     let slackMessage = null;
+    // Los cobros de los sitios se avisan además en #leads-web (SLACK_WEBHOOK_URL_LEADS; sin ella, solo el canal de
+    // siempre), con el formato corto de los avisos de lead de ese canal.
+    let leadsMessage = null;
 
     // ========== CHARGE.SUCCEEDED ==========
     if (event.type === "charge.succeeded") {
       const charge = event.data.object;
       const customer = await fetchCustomer(charge.customer);
       const origin = originFields(charge.metadata);
+
+      // Cupón del cobro (solo sitios). Es informativo: si la consulta falla, el aviso sale igual y lo dice,
+      // para que no se lea como «no hubo cupón».
+      let discount = null;
+      let discountUnknown = false;
+      if (origin && charge.payment_intent) {
+        try {
+          discount = sessionDiscount(await getCheckoutSession(charge.payment_intent, secretKey));
+        } catch (err) {
+          discountUnknown = true;
+          console.error(`getCheckoutSession FAIL: pi=${charge.payment_intent} err=${err.message}`);
+        }
+      }
 
       const customerName = customer?.name || charge.metadata?.name || "Sin nombre";
       const customerEmail = customer?.email || "Sin email";
@@ -281,6 +315,25 @@ export default async function handler(req, res) {
       const paymentMethod =
         charge.payment_method_details?.type || "desconocido";
       const receiptUrl = charge.receipt_url || null;
+
+      if (origin) {
+        const meta = charge.metadata;
+        const country = String(meta.country || "").toUpperCase();
+        leadsMessage = {
+          text: leadsPaymentText({
+            originLabel: ORIGIN_LABELS[meta.origin] || escapeMrkdwn(meta.origin),
+            name: meta.name || charge.billing_details?.name,
+            country: COUNTRY_LABELS[country] || meta.country,
+            plan: meta.plan,
+            phone: meta.phone,
+            email: charge.billing_details?.email || charge.receipt_email,
+            amount: `${amount} ${currency}`,
+            discount,
+            discountUnknown,
+            currency,
+          }),
+        };
+      }
 
       slackMessage = {
         blocks: [
@@ -308,6 +361,10 @@ export default async function handler(req, res) {
               { type: "mrkdwn", text: `*Fecha:*\n${fmtDate(charge.created)}` },
             ],
           },
+          ...(discount ? [{ type: "section", fields: discountFields(discount, currency) }] : []),
+          ...(discountUnknown
+            ? [{ type: "section", fields: [{ type: "mrkdwn", text: "*Cupón:*\nNo se pudo consultar" }] }]
+            : []),
           {
             type: "context",
             elements: [
@@ -407,6 +464,15 @@ export default async function handler(req, res) {
         );
       } catch (err) {
         console.error("Error posteando a Slack:", err.message);
+      }
+
+      const leadsWebhookUrl = process.env.SLACK_WEBHOOK_URL_LEADS;
+      if (leadsMessage && leadsWebhookUrl) {
+        try {
+          await postToSlack(leadsMessage, leadsWebhookUrl);
+        } catch (err) {
+          console.error("Error posteando a Slack (leads):", err.message);
+        }
       }
     }
 
