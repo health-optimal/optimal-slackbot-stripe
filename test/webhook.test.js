@@ -98,7 +98,7 @@ const slackPosts = () => calls.filter((c) => c.hostname === "hooks.slack.test");
 const stripeLookups = () => calls.filter((c) => c.hostname === "api.stripe.com" && c.path.startsWith("/v1/checkout/sessions"));
 const texts = (post) => JSON.parse(post.payload).blocks.flatMap((b) => (b.fields || []).map((f) => f.text));
 
-test("cobro de la web con cupón: se avisa en los dos canales con cupón y descuento", async () => {
+test("cobro de la web con cupón: el canal de siempre sale igual y #leads-web lleva cupón y descuento", async () => {
   withCoupon();
   assert.equal(await send(charge()), 200);
 
@@ -108,11 +108,10 @@ test("cobro de la web con cupón: se avisa en los dos canales con cupón y descu
 
   const [main, leads] = slackPosts();
   assert.deepEqual([main.path, leads.path], ["/services/principal", "/services/leads"]);
+  // El canal de siempre no cambia: el monto, y nada del cupón.
   const t = texts(main);
   assert.ok(t.includes("*Monto:*\n2399.20 MXN"));
-  assert.ok(t.includes("*Precio de lista:*\n2999.00 MXN"));
-  assert.ok(t.includes("*Cupón:*\nHOTBOOK20"));
-  assert.ok(t.includes("*Descuento:*\n20 % (599.80 MXN)"));
+  assert.equal(t.some((x) => /Cupón|Descuento|Precio de lista/.test(x)), false);
   // #leads-web: el formato corto de los avisos de lead, con los datos del metadata del cobro.
   assert.deepEqual(JSON.parse(leads.payload), {
     text: [
@@ -151,13 +150,25 @@ test("cobro de un origen sin etiqueta ni país conocido: se muestran tal cual, e
   ]);
 });
 
-test("sin SLACK_WEBHOOK_URL_LEADS: solo el canal de siempre, con el cupón", async () => {
+test("sin SLACK_WEBHOOK_URL_LEADS: nada nuevo, ni la consulta a Stripe", async () => {
   delete process.env.SLACK_WEBHOOK_URL_LEADS;
   withCoupon();
   assert.equal(await send(charge()), 200);
-  const posts = slackPosts();
-  assert.deepEqual(posts.map((p) => p.path), ["/services/principal"]);
-  assert.ok(texts(posts[0]).includes("*Cupón:*\nHOTBOOK20"));
+  assert.equal(stripeLookups().length, 0);
+  assert.deepEqual(slackPosts().map((p) => p.path), ["/services/principal"]);
+});
+
+test("el aviso del canal de siempre es idéntico con cupón, sin cupón, con la consulta fallida y sin #leads-web", async () => {
+  const mainPayload = async (setup) => {
+    calls.length = 0;
+    setup();
+    await send(charge());
+    return slackPosts().find((p) => p.path === "/services/principal").payload;
+  };
+  const sinCupon = await mainPayload(() => {});
+  assert.equal(await mainPayload(withCoupon), sinCupon);
+  assert.equal(await mainPayload(() => { responses.session = { status: 500, body: "{}" }; }), sinCupon);
+  assert.equal(await mainPayload(() => { delete process.env.SLACK_WEBHOOK_URL_LEADS; }), sinCupon);
 });
 
 test("cobro que no es de los sitios (sin origin): no consulta la sesión ni avisa en leads", async () => {
@@ -177,8 +188,8 @@ test("Stripe falla al consultar la sesión: el aviso sale igual, sin cupón", as
   responses.session = { status: 500, body: "{}" };
   assert.equal(await send(charge()), 200);
   const [main, leads] = slackPosts();
-  // No se confunde con «no hubo cupón»: los dos avisos dicen que no se pudo consultar.
-  assert.ok(texts(main).includes("*Cupón:*\nNo se pudo consultar"));
+  // No se confunde con «no hubo cupón»: #leads-web dice que no se pudo consultar. El canal de siempre, nada.
+  assert.equal(texts(main).some((x) => /Cupón/.test(x)), false);
   assert.ok(JSON.parse(leads.payload).text.split("\n").includes("🎟️ *Cupón:* no se pudo consultar"));
 });
 

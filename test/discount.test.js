@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { discountFields, sessionDiscount, sessionLookupPath } from "../lib/discount.js";
+import { discountLabels, sessionDiscount, sessionLookupPath } from "../lib/discount.js";
 
 const session = (over = {}) => ({
   amount_subtotal: 299900,
@@ -69,21 +69,18 @@ test("varios códigos: se listan todos, sin espacios sobrantes", () => {
   assert.equal(sessionDiscount(session({ discounts })).code, "UNO, DOS");
 });
 
-test("campos de Slack: precio de lista, cupón y descuento con porcentaje y monto", () => {
-  assert.deepEqual(
-    discountFields({ discount: 59980, listPrice: 299900, percent: 20, code: "HOTBOOK20" }, "MXN").map((f) => f.text),
-    ["*Precio de lista:*\n2999.00 MXN", "*Cupón:*\nHOTBOOK20", "*Descuento:*\n20 % (599.80 MXN)"],
-  );
+test("texto del descuento: cupón, y porcentaje con el monto", () => {
+  assert.deepEqual(discountLabels({ discount: 59980, listPrice: 299900, percent: 20, code: "HOTBOOK20" }, "MXN"), {
+    coupon: "HOTBOOK20", discount: "20 % (599.80 MXN)",
+  });
 });
 
-test("campos de Slack sin código ni porcentaje: raya y solo el monto", () => {
-  assert.deepEqual(
-    discountFields({ discount: 12345, listPrice: null, percent: null, code: null }, "PEN").map((f) => f.text),
-    ["*Cupón:*\n—", "*Descuento:*\n123.45 PEN"],
-  );
+test("texto del descuento sin código ni porcentaje: raya y solo el monto", () => {
+  assert.deepEqual(discountLabels({ discount: 12345, listPrice: null, percent: null, code: null }, "PEN"), {
+    coupon: "—", discount: "123.45 PEN",
+  });
 });
 
 test("el código se escapa para Slack", () => {
-  const [coupon] = discountFields({ discount: 1, listPrice: null, percent: null, code: "<!channel>&" }, "MXN");
-  assert.equal(coupon.text, "*Cupón:*\n&lt;!channel&gt;&amp;");
+  assert.equal(discountLabels({ discount: 1, listPrice: null, percent: null, code: "<!channel>&" }, "MXN").coupon, "&lt;!channel&gt;&amp;");
 });
